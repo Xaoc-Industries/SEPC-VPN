@@ -1,9 +1,8 @@
 from cryptography.hazmat.primitives.ciphers.aead import ChaCha20Poly1305, AESSIV
-from cryptography.hazmat.primitives.asymmetric import x25519
-from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives import hashes
 from concurrent.futures import ThreadPoolExecutor
+import oqs
 import re
 import base64
 import requests
@@ -22,11 +21,11 @@ import threading
 
 TUN_PATH = "/dev/net/tun"
 IFACE_NAME = "sepc0"
-BUF_SIZE = 1500
+BUF_SIZE = 1400
 NONCE_LEN = 12
 SEQ_MAGIC = b"SP"
 VER = 1
-HEADER_LEN = 28
+HEADER_LEN = 25
 FRAME_STRUCT = "<Q I"
 CTRL_FLAG = 0x01
 FRAG_FLAG = 0x02
@@ -87,55 +86,46 @@ def derive_keys(raw_shared: bytes, salt: bytes):
         hk(b"SEPC filetool pool SIV v1", 64),
     )
 
-def getkey_dh(port_number, endpoint_ip):
-    client_private = x25519.X25519PrivateKey.generate()
-    client_public = client_private.public_key()
+def getkey_kyber(port_number, endpoint_ip):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(20)
         attempt = 0
-        connected = False
         while attempt < 5:
             try:
                 s.connect((endpoint_ip, port_number))
-                connected = True
                 break
             except:
                 attempt += 1
                 time.sleep(2)
-        if not connected:
+        else:
             raise SystemExit("Failed to connect to peer for key exchange.")
-
-        s.sendall(client_public.public_bytes(
-            encoding=serialization.Encoding.Raw,
-            format=serialization.PublicFormat.Raw
-        ))
-        server_pub_bytes = recv_exact(s, 32)
-        server_public = x25519.X25519PublicKey.from_public_bytes(server_pub_bytes)
-        raw_shared = client_private.exchange(server_public)
+        pk_len = struct.unpack("<I", recv_exact(s, 4))[0]
+        server_pk = recv_exact(s, pk_len)
+        with oqs.KeyEncapsulation("Kyber1024") as kem:
+            ct, raw_shared = kem.encap_secret(server_pk)
+        s.sendall(struct.pack("<I", len(ct)))
+        s.sendall(ct)
         head = recv_exact(s, 16 + NONCE_LEN)
         salt, nonce = head[:16], head[16:]
         clen = struct.unpack("<I", recv_exact(s, 4))[0]
-        ct = recv_exact(s, clen)
+        ct_meta = recv_exact(s, clen)
         handshake_key, data_key, siv_key = derive_keys(raw_shared, salt)
-        meta_bytes = ChaCha20Poly1305(handshake_key).decrypt(nonce, ct, b"")
+        meta_bytes = ChaCha20Poly1305(handshake_key).decrypt(nonce, ct_meta, b"")
         meta = json.loads(meta_bytes.decode("utf-8"))
         file_sha_hex = meta.get("file_sha", "0" * 64)
         aad_bytes = base64.b64decode(meta["aad_b64"].encode("ascii"))
-        seed = int(meta["seed"])
         pool_id = int(meta["pool_id"])
         return {
             "handshake_key": handshake_key,
             "data_key": data_key,
             "siv_key": siv_key,
             "aad_bytes": aad_bytes,
-            "seed": seed,
             "pool_id": pool_id,
             "file_sha_hex": file_sha_hex
         }
 
-def sendkey_dh(port_number, meta_fields):
-    server_private = x25519.X25519PrivateKey.generate()
-    server_public = server_private.public_key()
+
+def sendkey_kyber(port_number, meta_fields):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         s.settimeout(20)
@@ -146,28 +136,32 @@ def sendkey_dh(port_number, meta_fields):
         s.listen(1)
         conn, addr = s.accept()
         conn.settimeout(20)
-        with conn:
-            client_pub_bytes = recv_exact(conn, 32)
-            client_public = x25519.X25519PublicKey.from_public_bytes(client_pub_bytes)
-            conn.sendall(server_public.public_bytes(
-                encoding=serialization.Encoding.Raw,
-                format=serialization.PublicFormat.Raw
-            ))
-            raw_shared = server_private.exchange(client_public)
+        with conn, oqs.KeyEncapsulation("Kyber1024") as kem:
+            public_key = kem.generate_keypair()
+            conn.sendall(struct.pack("<I", len(public_key)))
+            conn.sendall(public_key)
+            ct_len = struct.unpack("<I", recv_exact(conn, 4))[0]
+            ct = recv_exact(conn, ct_len)
+            raw_shared = kem.decap_secret(ct)
             salt = os.urandom(16)
             handshake_key, data_key, siv_key = derive_keys(raw_shared, salt)
             aad_bytes = os.urandom(16)
             meta = {
-                "seed": int(meta_fields["seed"]),
                 "pool_id": int(meta_fields["pool_id"]),
                 "aad_b64": base64.b64encode(aad_bytes).decode("ascii")
             }
             meta_bytes = json.dumps(meta).encode("utf-8")
             aead = ChaCha20Poly1305(handshake_key)
             nonce = os.urandom(NONCE_LEN)
-            ct = aead.encrypt(nonce, meta_bytes, b"")
-            conn.sendall(salt + nonce + struct.pack("<I", len(ct)) + ct)
-            return {"handshake_key": handshake_key, "data_key": data_key, "siv_key": siv_key, "aad_bytes": aad_bytes}
+            ct_meta = aead.encrypt(nonce, meta_bytes, b"")
+            conn.sendall(salt + nonce + struct.pack("<I", len(ct_meta)) + ct_meta)
+            return {
+                "handshake_key": handshake_key,
+                "data_key": data_key,
+                "siv_key": siv_key,
+                "aad_bytes": aad_bytes
+            }
+        return {"handshake_key": handshake_key, "data_key": data_key, "siv_key": siv_key, "aad_bytes": aad_bytes}
 
 def make_pool_plain(timeout):
     poolbytedata = []
@@ -215,21 +209,11 @@ def reference_mapper(pool_index_list, raw_bytes):
         indexes = pool_index_list.get(byt)
         this_selection = secrets.choice(indexes)
         host_payload_index_map.append(this_selection)
-    return host_payload_index_map
-
-def cryptor(plain_indices, key):
-    pld = []
-    loop_count = 0
-    for segment in plain_indices:
-        encoded_segment = key ^ segment
-        loop_count += 1
-        key = segment
-        pld.append(encoded_segment)
-    pld_arr = [i.to_bytes(2, 'big') for i in pld]
+    pld_arr = [i.to_bytes(2, 'big') for i in host_payload_index_map]
     pld = b''.join(pld_arr)
     return pld
 
-def decoder(encoded_indices, key, current_pool):
+def decoder(indices, current_pool):
     loop_count = 0
     entropy_pool = json.loads(current_pool)
     entropy_pool_bytes = base64.b64decode(entropy_pool["Data"])
@@ -239,17 +223,11 @@ def decoder(encoded_indices, key, current_pool):
     calc_pool_hash = calculated_hash.hexdigest()
     if calc_pool_hash != pool_hash:
         raise SystemExit("Decode Failed: Pool corruption detected.")
-    payload_int_data = []
-    for eindex in encoded_indices:
-        this_decoded_content = eindex ^ key
-        payload_int_data.append(this_decoded_content)
-        loop_count += 1
-        key = this_decoded_content
-    payload_json = bytearray()
-    for index in payload_int_data:
-        payload_json.append(entropy_pool_bytes[index])
-    jsonfile = bytes(payload_json)
-    return jsonfile
+    payload_arr = bytearray()
+    for index in indices:
+        payload_arr.append(entropy_pool_bytes[index])
+    decoded = bytes(payload_arr)
+    return decoded
 
 def aessiv_encrypt(key: bytes, aad: bytes, plaintext: bytes) -> bytes:
     siv = AESSIV(key)
@@ -275,7 +253,7 @@ def create_tun():
     print(f"[+] Opened TUN device: {IFACE_NAME}")
     return tun
 
-def reader(tun, sock, shared, seed, aead, aad_base, timeout, peer_ip, port, poolauth):
+def reader(tun, sock, shared, aead, aad_base, timeout, peer_ip, port, poolauth):
     seq = 0
     while True:
         data = os.read(tun, BUF_SIZE)
@@ -293,10 +271,9 @@ def reader(tun, sock, shared, seed, aead, aad_base, timeout, peer_ip, port, pool
                 new_pool_index_list = digester(new_pool_json)
                 payload = bytes([0xFF]) + new_pool_json.encode("utf-8")
                 indices = reference_mapper(curr_map, payload)
-                compressed = cryptor(indices, seed)
                 nonce = struct.pack("<Q", seq) + os.urandom(NONCE_LEN - 8)
                 aad = aad_base + struct.pack("<Q", seq)
-                ct = aead.encrypt(nonce, compressed, aad)
+                ct = aead.encrypt(nonce, indices, aad)
                 frag_id = secrets.randbits(32)
                 total = len(ct)
                 frag_cnt = (total + MAX_CHUNK - 1) // MAX_CHUNK
@@ -306,8 +283,6 @@ def reader(tun, sock, shared, seed, aead, aad_base, timeout, peer_ip, port, pool
                     chunk = ct[offset: offset + MAX_CHUNK]
                     offset += len(chunk)
                     header = bytearray()
-                    header += SEQ_MAGIC
-                    header += bytes([VER])
                     flags = CTRL_FLAG | (FRAG_FLAG if frag_cnt > 1 else 0)
                     header += bytes([flags])
                     header += struct.pack("<Q", seq)
@@ -329,13 +304,10 @@ def reader(tun, sock, shared, seed, aead, aad_base, timeout, peer_ip, port, pool
                 with shared.lock:
                     curr_map = shared.pool_index_list
                 indices = reference_mapper(curr_map, data)
-                compressed = cryptor(indices, seed)
                 nonce = struct.pack("<Q", seq) + os.urandom(NONCE_LEN - 8)
                 aad = aad_base + struct.pack("<Q", seq)
-                ct = aead.encrypt(nonce, compressed, aad)
+                ct = aead.encrypt(nonce, indices, aad)
                 header = bytearray()
-                header += SEQ_MAGIC
-                header += bytes([VER])
                 header += bytes([0])
                 header += struct.pack("<Q", seq)
                 header += struct.pack("<I", len(ct))
@@ -346,7 +318,7 @@ def reader(tun, sock, shared, seed, aead, aad_base, timeout, peer_ip, port, pool
             print(f"[!] Send error: {e}")
             break
 
-def writer(tun, sock, seed, shared, aead, aad_base, poolauth, pool_ttl_current, retry):
+def writer(tun, sock, shared, aead, aad_base, poolauth, pool_ttl_current, retry):
     buf = b""
     reassembly = {}
     while True:
@@ -359,19 +331,9 @@ def writer(tun, sock, seed, shared, aead, aad_base, poolauth, pool_ttl_current, 
             while True:
                 if len(buf) < HEADER_LEN:
                     break
-                if buf[0:2] != SEQ_MAGIC or buf[2] != VER:
-                    magic_pos = buf.find(SEQ_MAGIC)
-                    if magic_pos <= 0:
-                        buf = buf[2:] if len(buf) >= 2 else b""
-                    else:
-                        buf = buf[magic_pos:]
-                    if len(buf) < HEADER_LEN:
-                        break
-                    if buf[0:2] != SEQ_MAGIC or buf[2] != VER:
-                        break
-                flags = buf[3]
-                seq, chunk_len = struct.unpack("<Q I", buf[4:4+12])
-                nonce = buf[16:28]
+                flags = buf[0]
+                seq, chunk_len = struct.unpack("<Q I", buf[1:1+12])
+                nonce = buf[13:25]
                 pos = HEADER_LEN
                 if flags & FRAG_FLAG:
                     if len(buf) < HEADER_LEN + FRAG_EXT_LEN:
@@ -410,19 +372,19 @@ def writer(tun, sock, seed, shared, aead, aad_base, poolauth, pool_ttl_current, 
                     reassembly.pop(key, None)
                 try:
                     aad = aad_base + struct.pack("<Q", seq)
-                    indices = aead.decrypt(nonce, ct, aad)
+                    indices_blob = aead.decrypt(nonce, ct, aad)
                 except Exception as e:
                     print(f"[!] Decrypt failed for seq={seq}: {e}")
                     continue
                 try:
-                    if len(indices) % 2 != 0:
+                    if len(indices_blob) % 2 != 0:
                         print("[!] Bad encoded length, skipping frame")
                         continue
-                    encoded_indices = [int.from_bytes(indices[i:i+2], "big")
-                                       for i in range(0, len(indices), 2)]
+                    indices = [int.from_bytes(indices_blob[i:i+2], "big")
+                                       for i in range(0, len(indices_blob), 2)]
                     with shared.lock:
                         pj_snapshot = shared.pool_json
-                    decoded = decoder(encoded_indices, seed, pj_snapshot)
+                    decoded = decoder(indices, pj_snapshot)
                 except Exception as e:
                     print(f"[!] Decode failed for seq={seq}: {e}")
                     continue
@@ -465,7 +427,7 @@ def writer(tun, sock, seed, shared, aead, aad_base, poolauth, pool_ttl_current, 
             else:
                 raise SystemExit(f"[!] Receive error: {e}")
 
-def server_mode(tun, port, pool_index_list, pool_json, seed, data_key, aad_bytes, pool_id, pool_ttl, timeout, peer_ip, retry):
+def server_mode(tun, port, pool_index_list, pool_json, data_key, aad_bytes, pool_id, pool_ttl, timeout, peer_ip, retry):
     aead = ChaCha20Poly1305(data_key)
     aad_base = aad_bytes + struct.pack("<I", int(pool_id))
     shared = SharedState(pool_ttl, pool_json, pool_index_list)
@@ -475,11 +437,11 @@ def server_mode(tun, port, pool_index_list, pool_json, seed, data_key, aad_bytes
         data, addr = s.recvfrom(4096)
         print(f"[+] Connect from {addr[0]}:{addr[1]}")
         s.connect(addr)
-        t1 = threading.Thread(target=reader, args=(tun, s, shared, seed, aead, aad_base, timeout, None, None, True), daemon=True)
-        t2 = threading.Thread(target=writer, args=(tun, s, seed, shared, aead, aad_base, True, pool_ttl, retry), daemon=True)
+        t1 = threading.Thread(target=reader, args=(tun, s, shared, aead, aad_base, timeout, None, None, True), daemon=True)
+        t2 = threading.Thread(target=writer, args=(tun, s, shared, aead, aad_base, True, pool_ttl, retry), daemon=True)
         t1.start(); t2.start(); t1.join(); t2.join()
 
-def client_mode(tun, peer_ip, port, pool_index_list, pool_json, seed, data_key, aad_bytes, pool_id, pool_ttl, timeout, retry):
+def client_mode(tun, peer_ip, port, pool_index_list, pool_json, data_key, aad_bytes, pool_id, pool_ttl, timeout, retry):
     aead = ChaCha20Poly1305(data_key)
     aad_base = aad_bytes + struct.pack("<I", int(pool_id))
     shared = SharedState(pool_ttl, pool_json, pool_index_list)
@@ -489,8 +451,8 @@ def client_mode(tun, peer_ip, port, pool_index_list, pool_json, seed, data_key, 
         s.send(b"\xff")
         print("[+] Connected.")
         with ThreadPoolExecutor(max_workers=2) as executor:
-            future_reader = executor.submit(reader, tun, s, shared, seed, aead, aad_base, timeout, None, None, False)
-            future_writer = executor.submit(writer, tun, s, seed, shared, aead, aad_base, False, pool_ttl, retry)
+            future_reader = executor.submit(reader, tun, s, shared, aead, aad_base, timeout, None, None, False)
+            future_writer = executor.submit(writer, tun, s, shared, aead, aad_base, False, pool_ttl, retry)
             result = future_writer.result()
             if result is False and retry:
                 return True
@@ -520,40 +482,36 @@ def main():
         timeout = 600
     tun = create_tun()
     set_tun_mtu(IFACE_NAME, 1500)
-    BUF_SIZE = 540
     if args.reconnect:
         retry = True
     else:
         retry = False
     if args.connect:
+        ent_pool, pool_id, poolhash, poolidhash = make_pool_plain(timeout)
+        pool_ttl = json.loads(ent_pool)["TTL"]
+        pool_url = f"{args.pool}/{poolidhash}"
         try:
             with socket.create_connection((args.connect, data_port), timeout=5) as probe:
                 probe.sendall(bytes([255]))
         except Exception as e:
             raise SystemExit(f"Failed to probe data port on receiver: {e}")
-        key_1 = _sr._randbelow(7680) + 1
-        key1_padded = "{:05d}".format(key_1)
-        ent_pool, pool_id, poolhash, poolidhash = make_pool_plain(timeout)
-        pool_ttl = json.loads(ent_pool)["TTL"]
-        pool_url = f"{args.pool}/{poolidhash}"
-        hk = sendkey_dh(key_port, {"seed": key_1, "pool_id": pool_id})
+        hk = sendkey_kyber(key_port, {"pool_id": pool_id})
         siv_key = hk["siv_key"]
         aad_bytes = hk["aad_bytes"]
         data_key = hk["data_key"]
         enc_pool_b64 = encrypt_pool_for_vault(ent_pool, siv_key, aad_bytes)
         pool_references = digester(ent_pool)
         post_pool(pool_url, enc_pool_b64)
-        server_mode(tun, data_port, pool_references, ent_pool, key_1, data_key, aad_bytes, pool_id, pool_ttl, timeout, args.connect, False)
+        server_mode(tun, data_port, pool_references, ent_pool, data_key, aad_bytes, pool_id, pool_ttl, timeout, args.connect, False)
     else:
         retry_now = True
         while retry_now:
             retry_now = False
             currentpeer = listen(data_port)
-            hk = getkey_dh(key_port, currentpeer)
+            hk = getkey_kyber(key_port, currentpeer)
             data_key = hk["data_key"]
             siv_key = hk["siv_key"]
             aad_bytes = hk["aad_bytes"]
-            key_1 = hk["seed"]
             pool_id = hk["pool_id"]
             poolidhash = hashlib.sha256(str(pool_id).encode("ascii")).hexdigest()
             vault_id = f"{args.pool}/{poolidhash}"
@@ -578,11 +536,11 @@ def main():
             b64_pool = json.loads(pool_json)["Data"]
             pool_bytes = base64.b64decode(b64_pool)
             pool_references = digester(pool_json)
-            retry_now = client_mode(tun, currentpeer, data_port, pool_references, pool_json, key_1, data_key, aad_bytes, pool_id, pool_ttl, timeout, retry)
+            retry_now = client_mode(tun, currentpeer, data_port, pool_references, pool_json, data_key, aad_bytes, pool_id, pool_ttl, timeout, retry)
 
 if __name__ == "__main__":
     print("--------------------------------------------------------------------------------")
-    print("|     HekateForge SEPC VPN Protocol Release 1.0 - Patent Pending #3278624      |")
+    print("|     HekateForge SEPC VPN Protocol Release 2.0 - Patent Pending #3278624      |")
     print("--------------------------------------------------------------------------------")
     _sr = secrets.SystemRandom()
     main()
