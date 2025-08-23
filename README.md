@@ -16,8 +16,6 @@ sudo sepc-vpn -l
 
 sudo sepc-vpn -c {SERVER_IP}
 
-**A free use vault for {VAULT_ADDRESS} is available at https://www.hekateforge.com:8080/pool**
-
 
 ***AND***
 
