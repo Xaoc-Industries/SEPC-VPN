@@ -1,3 +1,10 @@
+**Installer**
+
+*The installer is a shell script contained in a zip folder*
+*to install, **YOU MUST RUN AS ROOT** afer extracting from the zip*
+
+once you extract, you must chmod +x the sh file.
+
 **Server:**
 
 sudo sepc-vpn -l -p {VAULT_ADDRESS}
