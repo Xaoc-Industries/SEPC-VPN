@@ -214,7 +214,6 @@ def reference_mapper(pool_index_list, raw_bytes):
     return pld
 
 def decoder(indices, current_pool):
-    loop_count = 0
     entropy_pool = json.loads(current_pool)
     entropy_pool_bytes = base64.b64decode(entropy_pool["Data"])
     pool_hash = entropy_pool["SHA256"]
