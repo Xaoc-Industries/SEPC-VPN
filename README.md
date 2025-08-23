@@ -10,11 +10,11 @@ once you extract, you must chmod +x the sh file.
 
 **Server:**
 
-sudo sepc-vpn -l -p {VAULT_ADDRESS}
+sudo sepc-vpn -l
 
 **Client:**
 
-sudo sepc-vpn -c {SERVER_IP} -p {VAULT_ADDRESS}
+sudo sepc-vpn -c {SERVER_IP}
 
 **A free use vault for {VAULT_ADDRESS} is available at https://www.hekateforge.com:8080/pool**
 
